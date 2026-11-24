@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+rclone.conf
+destinations.json
+*.upload.json
+*.audio.json
+*.mkv
+*.mp4

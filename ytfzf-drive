@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""Download ytfzf selections and upload verified sections to Drive or GitHub."""
+import argparse
+import configparser
+import hashlib
+import json
+import math
+import os
+import re
+from pathlib import Path
+import selectors
+import threading
+from collections import deque
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote
+
+sys.path.append(str(Path.home() / ".local/share/ytfzf-install"))
+from range_stream import RangeStream
+from audio_normalize import normalize as normalize_audio
+
+CONFIG = Path.home() / ".config/ytfzf-drive/rclone.conf"
+DESTINATIONS = CONFIG.with_name("destinations.json")
+DOWNLOADS = Path.home() / "Videos/ytfzf-drive"
+REMOTE = "ytfzf-drive:"
+STATS = Path.home() / ".local/share/ytfzf-install/transfer-stats.json"
+MAX_SECONDS = 595  # Leave five seconds for stopping subprocesses before ten minutes.
+SECTION_SECONDS = 30 * 60
+DEADLINE = None
+
+
+class CommandError(RuntimeError):
+    def __init__(self, command, returncode, stderr=""):
+        super().__init__(f"{Path(command[0]).name} failed (exit {returncode}).")
+        self.returncode = returncode
+        self.stderr = stderr or ""
+        self.quota_limited = "quota exceeded" in self.stderr.lower()
+
+
+def stop_process(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def remaining():
+    if DEADLINE is None:
+        return None
+    seconds = DEADLINE - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError(timeout_message())
+    return seconds
+
+
+def timeout_message():
+    elapsed = MAX_SECONDS - (DEADLINE - time.monotonic()) if DEADLINE is not None else 0
+    return (f"The ten-minute section limit was reached after {int(elapsed // 60)}m "
+            f"{int(elapsed % 60):02d}s of checks, download, and upload; completed files are retained.")
+
+
+def run(command, capture=False, show_errors=True):
+    process = subprocess.Popen(command, text=True, start_new_session=True,
+                               stdout=subprocess.PIPE if capture else None,
+                               stderr=subprocess.PIPE)
+    errors = deque(maxlen=100)
+    reader = None
+    if not capture:
+        def tee_stderr():
+            for line in process.stderr:
+                errors.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        reader = threading.Thread(target=tee_stderr, daemon=True)
+        reader.start()
+    try:
+        if capture:
+            stdout, stderr = process.communicate(timeout=remaining())
+        else:
+            process.wait(timeout=remaining())
+            reader.join(timeout=1)
+            if reader.is_alive():
+                stop_process(process)
+                reader.join(timeout=1)
+            stdout, stderr = None, "".join(errors)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt, TimeoutError):
+        stop_process(process)
+        if reader is not None:
+            reader.join(timeout=1)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
+        if sys.exc_info()[0] is KeyboardInterrupt:
+            raise
+        raise TimeoutError(timeout_message())
+    if not capture:
+        process.stderr.close()
+    if process.returncode:
+        if capture and stderr and show_errors:
+            print(stderr.strip(), file=sys.stderr)
+        raise CommandError(command, process.returncode, stderr)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def run_section_download(command, media_seconds):
+    """Show ETA from ffmpeg media progress while enforcing the section deadline."""
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               start_new_session=True, bufsize=0)
+    started = time.monotonic()
+    last_display = 0
+    pending = b""
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while selector.get_map():
+                seconds = remaining()
+                for key, _ in selector.select(timeout=min(1, seconds) if seconds is not None else 1):
+                    data = os.read(key.fileobj.fileno(), 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    pending += data
+                    while b"\n" in pending:
+                        raw, pending = pending.split(b"\n", 1)
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if line.startswith("out_time_us="):
+                            try:
+                                position = max(0, float(line.split("=", 1)[1]) / 1e6)
+                            except ValueError:
+                                continue
+                            now = time.monotonic()
+                            if now - last_display >= 1:
+                                elapsed = max(0.001, now - started)
+                                speed = position / elapsed
+                                eta = max(0, media_seconds - position) / speed if speed > 0 else None
+                                eta_text = f"{int(eta // 60)}m {int(eta % 60):02d}s" if eta is not None else "measuring"
+                                print(f"Download {min(100, position / media_seconds * 100):5.1f}% | ETA {eta_text}", flush=True)
+                                last_display = now
+                        elif line.startswith("[") or "Error" in line or "error" in line:
+                            print(line, flush=True)
+                    if len(pending) > 262144:
+                        pending = pending[-262144:]
+            process.wait(timeout=remaining())
+            if process.returncode:
+                raise RuntimeError(f"Section download failed (exit {process.returncode}).")
+        except (subprocess.TimeoutExpired, TimeoutError, KeyboardInterrupt):
+            stop_process(process)
+            if sys.exc_info()[0] is KeyboardInterrupt:
+                raise
+            raise TimeoutError(timeout_message())
+        finally:
+            process.stdout.close()
+
+
+def transfer_stats():
+    try:
+        return json.loads(STATS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def record_speed(stage, size, seconds):
+    stats = transfer_stats()
+    if seconds > 0:
+        stats[stage] = size / seconds
+        STATS.write_text(json.dumps(stats) + "\n")
+
+
+def transfer_rates():
+    stats = transfer_stats()
+    # Initial estimates are used only until successful transfers establish rates.
+    download = float(stats.get("download") or 8 * 1024 * 1024)
+    upload = float(stats.get("upload") or 1024 * 1024)
+    if download <= 0 or upload <= 0:
+        raise RuntimeError("Recorded transfer speeds must be positive.")
+    return download, upload
+
+
+
+
+
+
+def estimated_size(fmt, duration):
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return float(size)
+    rate = fmt.get("tbr") or fmt.get("vbr") or fmt.get("abr")
+    return float(rate) * 1000 / 8 * duration if rate else None
+
+
+
+
+
+
+def rclone(*args, capture=False):
+    return run(["rclone", "--config", str(CONFIG), "--tpslimit", "1", "--tpslimit-burst", "1",
+                "--disable-http2", *args], capture)
+
+
+def drive_folder_id():
+    settings = configparser.ConfigParser(interpolation=None)
+    settings.read(CONFIG)
+    return settings.get("ytfzf-drive", "root_folder_id", fallback="").strip()
+
+
+def setup_folder_id():
+    folder = os.environ.get("YTFZF_DRIVE_FOLDER_ID") or drive_folder_id()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", folder):
+        raise RuntimeError("Set YTFZF_DRIVE_FOLDER_ID to the destination Google Drive folder ID before setup.")
+    return folder
+
+
+def check_connection():
+    if not drive_folder_id():
+        raise RuntimeError("The ytfzf Drive configuration has no destination folder ID.")
+    if not CONFIG.exists() or REMOTE not in rclone("listremotes", capture=True).stdout.splitlines():
+        raise RuntimeError("Drive is not connected yet. Run: ytfzf-drive --setup")
+    # Check this folder without listing the user's other Drive files.
+    rclone("lsf", REMOTE, "--max-depth", "1", "--dirs-only", capture=True)
+
+
+def setup(headless=False):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    exists = CONFIG.exists() and REMOTE in rclone("listremotes", capture=True).stdout.splitlines()
+    connected = False
+    if exists:
+        try:
+            check_connection()
+            connected = True
+        except RuntimeError:
+            pass
+    if not connected:
+        print("Sign into the Google account that can upload to the configured Drive folder.", flush=True)
+        command = ["rclone", "--config", str(CONFIG), "config",
+                   "update" if exists else "create", "ytfzf-drive"]
+        if not exists:
+            command += ["drive", "scope", "drive.file"]
+        command += ["root_folder_id", setup_folder_id(),
+                    "config_is_local", "true",
+                    "config_auth_no_browser", "true" if headless else "false"]
+        # Keep the generated OAuth configuration out of console output.
+        # rclone's sign-in instructions are emitted on stderr.
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+    CONFIG.chmod(0o600)
+    check_connection()
+    print("Drive connected. Selecting a video in ytfzf will now download and upload it.")
+
+
+def setup_dedicated_client(client_file, headless=False):
+    """Import a user's desktop OAuth JSON locally, without displaying credentials."""
+    if client_file.stat().st_size > 65536:
+        raise RuntimeError("Choose the downloaded desktop OAuth client JSON file.")
+    document = json.loads(client_file.read_text())
+    client = document.get("installed") if isinstance(document, dict) else None
+    if not isinstance(client, dict):
+        raise RuntimeError("Choose a Google desktop OAuth client JSON file.")
+    client_id, secret = client.get("client_id"), client.get("client_secret")
+    if not isinstance(client_id, str) or not client_id.endswith(".apps.googleusercontent.com") or not isinstance(secret, str) or not secret:
+        raise RuntimeError("The client JSON is missing required desktop OAuth fields.")
+    CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    settings = configparser.ConfigParser(interpolation=None)
+    settings["ytfzf-drive"] = {"type": "drive", "client_id": client_id, "client_secret": secret,
+                              "scope": "drive", "root_folder_id": setup_folder_id()}
+    # No credentials appear in argv, console output, or a failed-command message.
+    staging = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=CONFIG.parent, prefix="dedicated-", suffix=".conf", delete=False) as output:
+            staging = Path(output.name)
+            settings.write(output)
+        staging.chmod(0o600)
+        result = subprocess.run(["rclone", "--config", str(staging), "config", "update", "ytfzf-drive",
+                                 "config_is_local", "true", "config_auth_no_browser", "true" if headless else "false"],
+                                stdout=subprocess.DEVNULL)
+        if result.returncode:
+            raise RuntimeError("Dedicated-client sign-in did not complete. The current uploader connection was preserved.")
+        try:
+            verify = subprocess.run(["rclone", "--config", str(staging), "lsf", REMOTE,
+                                     "--max-depth", "1", "--dirs-only"], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Dedicated-client access verification timed out. The current connection was preserved.") from None
+        if verify.returncode:
+            raise RuntimeError("Dedicated-client access to the configured folder could not be verified. The current connection was preserved.")
+        staging.chmod(0o600)
+        staging.replace(CONFIG)
+    finally:
+        if staging is not None:
+            staging.unlink(missing_ok=True)
+    print("Dedicated Drive client connected and Drive access verified. Saved section transfers can now resume.")
+
+
+def video_folder(title, video_id):
+    title = re.sub(r"[^A-Za-z0-9._-]+", "_", title or "video")[:100]
+    return f"{title.replace('_', ' ').strip()} [{video_id}]"
+
+
+def digest_file(path, algorithm):
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            remaining()
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def checked_repo(repo):
+    if not isinstance(repo, str) or not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", repo):
+        raise RuntimeError("Set --github-repo to an owner/repository on GitHub.com.")
+    return repo
+
+
+def github_json(endpoint, *, missing=False):
+    try:
+        result = run(["gh", "api", "--hostname", "github.com", endpoint], capture=True,
+                     show_errors=not missing)
+    except CommandError as error:
+        if missing and "(HTTP 404)" in error.stderr:
+            return None
+        raise
+    return json.loads(result.stdout)
+
+
+def prepare_github(repo):
+    repo = checked_repo(repo)
+    if not shutil.which("gh"):
+        raise RuntimeError("GitHub uploads require the authenticated GitHub CLI (gh).")
+    details = github_json(f"repos/{repo}")
+    if not details.get("permissions", {}).get("push") or details.get("archived") or details.get("disabled"):
+        raise RuntimeError(f"The authenticated GitHub account cannot publish releases to {repo}.")
+    return {"type": "github", "repo": details["full_name"]}
+
+
+def select_destination(mode, repo, pinned=None, folder=None):
+    if pinned:
+        if pinned.get("type") not in ("drive", "github"):
+            raise RuntimeError("Invalid destination in the saved job or receipt.")
+        if mode != "auto" and mode != pinned["type"]:
+            raise RuntimeError("This job already has a saved upload destination.")
+        if pinned["type"] == "github":
+            return prepare_github(pinned.get("repo"))
+        mode = "drive"
+    if mode != "github":
+        try:
+            if not shutil.which("rclone"):
+                raise RuntimeError("Drive uploads require rclone.")
+            check_connection()
+            if folder:
+                rclone("mkdir", REMOTE + folder)
+            return {"type": "drive"}
+        except (RuntimeError, OSError) as error:
+            if mode == "drive" or not repo:
+                raise
+            print(f"Drive unavailable ({error}) Switching to GitHub Releases.", flush=True)
+    return prepare_github(repo)
+
+
+def github_release(repo, tag):
+    if not re.fullmatch(r"ytfzf-[A-Za-z0-9_-]+", tag):
+        raise RuntimeError("Invalid GitHub release tag.")
+    return github_json(f"repos/{checked_repo(repo)}/releases/tags/{tag}", missing=True)
+
+
+def github_asset(repo, release, name):
+    page = 1
+    while True:
+        assets = github_json(f"repos/{checked_repo(repo)}/releases/{int(release['id'])}/assets?per_page=100&page={page}")
+        match = next((asset for asset in assets if asset["name"] == name), None)
+        if match is not None or len(assets) < 100:
+            return match
+        page += 1
+
+
+def upload_github(path, folder, repo, video_id):
+    if path.stat().st_size >= 2 * 1024**3:
+        raise RuntimeError("GitHub Release assets must be smaller than 2 GiB. The local section is retained.")
+    digest = digest_file(path, "sha256")
+    key = video_id or "local-" + digest[:16]
+    tag = f"ytfzf-{key}"
+    release = github_release(repo, tag)
+    if release is None:
+        command = ["gh", "release", "create", tag, "--repo", f"github.com/{repo}",
+                   "--title", folder, "--notes", "Video sections uploaded by ytfzf.",
+                   "--prerelease", "--latest=false"]
+        try:
+            run(command, capture=True)
+        except CommandError:
+            release = github_release(repo, tag)
+            if release is None:
+                raise
+        else:
+            release = github_release(repo, tag)
+    if release is None or release.get("draft"):
+        raise RuntimeError("The GitHub release is unavailable for upload verification.")
+    safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "-", path.stem).strip("-")[:120] or "video"
+    name_key = hashlib.sha256(path.name.encode()).hexdigest()[:12]
+    suffix = re.sub(r"[^A-Za-z0-9.]+", "", path.suffix)[:12]
+    name = f"{safe_stem}-{name_key}{suffix}"
+    asset = github_asset(repo, release, name)
+    if asset is None:
+        endpoint = f"https://uploads.github.com/repos/{repo}/releases/{int(release['id'])}/assets?name={quote(name)}"
+        try:
+            run(["gh", "api", "--hostname", "github.com", "--method", "POST", endpoint,
+                 "--header", "Content-Type: application/octet-stream", "--input", str(path), "--silent"], capture=True)
+        except CommandError:
+            asset = github_asset(repo, release, name)
+            if asset is None:
+                raise
+        else:
+            asset = github_asset(repo, release, name)
+    if not asset or not asset.get("id") or asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size or asset.get("digest") != f"sha256:{digest}":
+        raise RuntimeError("GitHub asset verification failed. The local video is retained.")
+    return {"backend": "github", "repo": repo, "tag": tag, "asset": name, "asset_id": asset["id"],
+            "sha256": digest, "size": asset["size"], "url": asset["browser_download_url"]}
+
+
+def upload_drive(path, folder):
+    remote_path = f"{folder}/{path.name}"
+    destination = REMOTE + remote_path
+    rclone("copyto", str(path), destination, "--immutable", "--checksum", "--progress", "--stats", "1s",
+           "--timeout", "30s", "--contimeout", "10s", "--low-level-retries", "2", "--retries", "1",
+           "--disable-http2")
+    metadata = json.loads(rclone("lsjson", destination, "--stat", "--hash", capture=True).stdout)
+    remote_md5 = metadata.get("Hashes", {}).get("md5")
+    if (metadata.get("Size") != path.stat().st_size or not metadata.get("ID") or not remote_md5
+            or digest_file(path, "md5") != remote_md5):
+        raise RuntimeError("Drive file verification failed. The local video is retained.")
+    return {"backend": "drive", "folder_id": drive_folder_id(), "drive_file_id": metadata["ID"],
+            "remote_path": remote_path, "size": metadata["Size"], "md5": remote_md5}
+
+
+def upload_file(path, destination, folder, video_id=None):
+    path = path.resolve(strict=True)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"No complete video to upload: {path}")
+    print("Normalizing audio to the saved loudness target...", flush=True)
+    normalize_audio(path, run=run)
+    if completed_section_is_current(path):
+        path.unlink()
+        print(f"Already uploaded and verified. Removed local copy: {path.name}", flush=True)
+        return
+    started = time.monotonic()
+    if destination["type"] == "github":
+        print(f"Uploading {path.name} to public GitHub Releases at {destination['repo']}...", flush=True)
+        receipt = upload_github(path, folder, destination["repo"], video_id)
+    else:
+        print(f"Uploading {path.name} to Google Drive/{folder}...", flush=True)
+        receipt = upload_drive(path, folder)
+    receipt.update(file=str(path), status="uploaded")
+    write_json(path.with_name(path.name + ".upload.json"), receipt)
+    record_speed("upload", path.stat().st_size, time.monotonic() - started)
+    path.unlink()
+    print(f"Upload verified. Removed local copy: {path}", flush=True)
+    if receipt.get("url"):
+        print(receipt["url"], flush=True)
+
+
+def section_ranges(duration, section_seconds=SECTION_SECONDS):
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("The source must have a finite recorded duration.")
+    if type(section_seconds) is not int or section_seconds not in (1200, 1800):
+        raise RuntimeError("Unsupported section length in the saved plan.")
+    return [{"start": start, "end": min(start + section_seconds, duration), "status": "pending"}
+            for start in range(0, math.ceil(duration), section_seconds)]
+
+
+def choose_section_format(info):
+    duration = float(info.get("duration") or 0)
+    if info.get("is_live") or not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("Video sections require a recorded video with a finite duration.")
+    videos = [f for f in info.get("formats", []) if float(f.get("height") or 0) > 0
+              and f.get("vcodec") not in (None, "none")
+              and estimated_size(f, duration)]
+    audio = [f for f in info.get("formats", []) if f.get("vcodec") == "none"
+             and f.get("acodec") not in (None, "none") and estimated_size(f, duration)
+             and float(f.get("abr") or f.get("tbr") or 0) > 0]
+    if audio:
+        preference = max(float(f.get("language_preference") or 0) for f in audio)
+        audio = [f for f in audio if float(f.get("language_preference") or 0) == preference]
+    pairs = []
+    for video in videos:
+        sounds = audio if video.get("acodec") in (None, "none") else [None]
+        for sound in sounds:
+            size = estimated_size(video, duration) + (estimated_size(sound, duration) if sound else 0)
+            bitrate = float(sound.get("abr") or sound.get("tbr") or 0) if sound else 128
+            spec = str(video["format_id"]) + ("+" + str(sound["format_id"]) if sound else "")
+            # Prefer 1080p, then the nearest resolution (higher wins ties).
+            # Keep native frame rates; 30 fps sources are usable too.
+            height = float(video["height"])
+            rank = (abs(height - 1080), -height, -float(video.get("fps") or 0))
+            pairs.append((rank, bitrate, size, spec))
+    if not pairs:
+        raise RuntimeError("This video does not offer usable video with audio for 720p conversion.")
+    best_rank = min(item[0] for item in pairs)
+    pairs = [item for item in pairs if item[0] == best_rank]
+    good_audio = [item for item in pairs if item[1] >= 96]
+    _, _, size, spec = min(good_audio or pairs, key=lambda item: item[2])
+    return spec, size / duration
+
+
+def write_json(path, data):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as output:
+        staging = Path(output.name)
+        try:
+            json.dump(data, output, indent=2)
+            output.write("\n")
+            output.close()
+            staging.replace(path)
+        finally:
+            staging.unlink(missing_ok=True)
+
+
+def save_plan(job, plan):
+    write_json(job / "section-plan.json", plan)
+
+
+def verify_section(path, expected_seconds):
+    metadata = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
+                               "format=duration:stream=codec_type,height,avg_frame_rate,r_frame_rate",
+                               "-of", "json", str(path)], capture=True).stdout)
+    streams = metadata.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    numerator, denominator = (video.get("avg_frame_rate") or "0/1").split("/")
+    fps = float(numerator) / float(denominator) if float(denominator) else 0
+    duration = float(metadata.get("format", {}).get("duration") or 0)
+    if video.get("height") != 720 or not math.isfinite(fps) or fps <= 0:
+        raise RuntimeError("Downloaded section is not playable 720p video; upload stopped.")
+    if not any(s.get("codec_type") == "audio" for s in streams):
+        raise RuntimeError("Downloaded section has no audio; upload stopped.")
+    # Allow keyframe rounding for retained sections made by the earlier copier.
+    if duration <= 0 or abs(duration - expected_seconds) > 15:
+        raise RuntimeError("Downloaded section duration does not match its planned range; upload stopped.")
+
+
+def download_section(job, spec, info, index, start, end):
+    directory = job / f"section-{index:02d}"
+    directory.mkdir(exist_ok=True)
+    formats = {fmt["format_id"]: fmt for fmt in info["formats"]}
+    try:
+        selected = [formats[part] for part in spec.split("+")]
+    except KeyError:
+        raise RuntimeError("The source's chosen video/audio format is no longer available.") from None
+    for fmt in selected:
+        if not fmt.get("http_headers"):
+            fmt["http_headers"] = info.get("http_headers") or {}
+    label = f"section-{index:02d}_{int(start):06d}-{int(end):06d}"
+    title = re.sub(r"[^A-Za-z0-9._-]+", "_", info.get("title") or "video")[:100]
+    path = directory / f"{title} [{info['id']}] [720p] {label}.mkv"
+    if not path.resolve().is_relative_to(directory.resolve()):
+        raise RuntimeError("Section filename escaped its private output directory.")
+    staging = path.with_name(path.name + ".part")
+    started = time.monotonic()
+    source_video = next(fmt for fmt in selected if fmt.get("vcodec") not in (None, "none"))
+    print(f"Source {source_video.get('height')}p at {source_video.get('fps') or 'native'} fps -> 720p; "
+          "preserving source frame rate and audio.", flush=True)
+    with RangeStream(selected) as streams:
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+        for stream in streams:
+            command += ["-ss", str(start), "-i", stream]
+        video_options = (["-c:v", "copy"] if source_video.get("height") == 720 else
+                         ["-vf", "scale=-2:720", "-c:v", "libx264", "-preset", "veryfast",
+                          "-crf", "23", "-pix_fmt", "yuv420p"])
+        command += ["-t", str(end - start), "-map", "0:v:0", "-map", "1:a:0" if len(streams) > 1 else "0:a:0",
+                    *video_options, "-c:a", "copy", "-avoid_negative_ts", "make_zero", "-f", "matroska",
+                    "-progress", "pipe:1", "-nostats", str(staging)]
+        run_section_download(command, end - start)
+    if not staging.is_file() or staging.stat().st_size == 0:
+        raise RuntimeError("Section download did not produce a completed file.")
+    verify_section(staging, end - start)
+    staging.replace(path)
+    record_speed("download", path.stat().st_size, time.monotonic() - started)
+    return path.resolve()
+
+
+def read_receipt(path):
+    receipt_file = path.with_name(path.name + ".upload.json")
+    return json.loads(receipt_file.read_text()) if receipt_file.exists() else None
+
+
+def receipt_destination(receipt):
+    if receipt.get("backend") == "github":
+        return {"type": "github", "repo": checked_repo(receipt.get("repo"))}
+    return {"type": "drive"}
+
+
+def completed_section_is_current(path):
+    receipt = read_receipt(path)
+    if not receipt or receipt.get("status") != "uploaded":
+        return False
+    if receipt.get("backend") == "github":
+        repo = checked_repo(receipt.get("repo"))
+        release = github_release(repo, receipt["tag"])
+        asset = github_asset(repo, release, receipt["asset"]) if release else None
+        digest = receipt.get("sha256")
+        matches = (bool(asset) and bool(digest) and asset.get("id") == receipt.get("asset_id")
+                   and asset.get("state") == "uploaded" and asset.get("size") == receipt.get("size")
+                   and asset.get("digest") == f"sha256:{digest}")
+        algorithm = "sha256"
+    else:
+        if receipt.get("folder_id") != drive_folder_id():
+            raise RuntimeError("The configured Drive folder differs from the saved upload receipt.")
+        remote_path = receipt.get("remote_path", path.name)
+        if not isinstance(remote_path, str) or remote_path.startswith("/") or ".." in remote_path.split("/"):
+            raise RuntimeError("Invalid remote path in the upload receipt.")
+        try:
+            metadata = json.loads(rclone("lsjson", REMOTE + remote_path, "--stat", "--hash", capture=True).stdout)
+        except CommandError as error:
+            if error.returncode in (3, 4):
+                return False
+            raise
+        digest = receipt.get("md5")
+        matches = (bool(digest) and digest == metadata.get("Hashes", {}).get("md5")
+                   and receipt.get("size") == metadata.get("Size") and metadata.get("ID")
+                   and (not receipt.get("drive_file_id") or receipt["drive_file_id"] == metadata["ID"]))
+        algorithm = "md5"
+    if matches and path.exists():
+        return path.stat().st_size == receipt["size"] and digest_file(path, algorithm) == digest
+    return bool(matches)
+
+
+def process_sections(job, plan, mode, repo, info=None):
+    global DEADLINE
+    if info is None:
+        DEADLINE = time.monotonic() + MAX_SECONDS
+        info = json.loads(run(["yt-dlp", "--no-playlist", "--skip-download", "--dump-single-json", "--", plan["url"]], capture=True).stdout)
+    if info.get("id") != plan["video_id"]:
+        raise RuntimeError("The source no longer matches the section plan's video identity.")
+    folder = plan.get("drive_folder") or video_folder(info.get("title"), info["id"])
+    if not isinstance(folder, str) or folder in (".", "..") or "/" in folder or "\\" in folder:
+        raise RuntimeError("Invalid video folder in the saved plan.")
+    pinned = plan.get("destination")
+    if pinned is None:
+        for section in plan["sections"]:
+            if section.get("file"):
+                saved_path = (job / section["file"]).resolve()
+                if not saved_path.is_relative_to(job.resolve()):
+                    raise RuntimeError("Section output escaped the job directory.")
+                receipt = read_receipt(saved_path)
+                if receipt or section.get("status") == "uploaded":
+                    pinned = receipt_destination(receipt) if receipt else {"type": "drive"}
+                    break
+    destination = select_destination(mode, repo, pinned, folder)
+    plan["destination"] = destination
+    plan["drive_folder"] = folder
+    save_plan(job, plan)
+    section_minutes = plan.get("section_seconds", 1200) // 60
+    print(f"720p output, source frame rate | {len(plan['sections'])} sections of up to {section_minutes} minutes | ten-minute limit per section.", flush=True)
+    print(f"Resume if interrupted: ytfzf-drive --resume '{job}'", flush=True)
+    for index, section in enumerate(plan["sections"], 1):
+        DEADLINE = time.monotonic() + MAX_SECONDS
+        path = (job / section["file"]).resolve() if section.get("file") else None
+        if path is not None and not path.is_relative_to(job.resolve()):
+            raise RuntimeError("Section output escaped the job directory.")
+        if path is not None:
+            if completed_section_is_current(path):
+                path.unlink(missing_ok=True)
+                print(f"Section {index}/{len(plan['sections'])} is already uploaded and verified.", flush=True)
+                section["status"] = "uploaded"
+                save_plan(job, plan)
+                continue
+        start, end = section["start"], section["end"]
+        download, upload = transfer_rates()
+        size = plan["bytes_per_second"] * (end - start)
+        eta = size * (1 / download + 1 / upload) * 1.1 + 20
+        print(f"Section {index}/{len(plan['sections'])}: {start / 60:g}–{end / 60:g} minutes | "
+              f"about {size / 1024**2:.1f} MiB | estimated download + upload {int(eta // 60)}m {int(eta % 60):02d}s.", flush=True)
+        if eta > MAX_SECONDS:
+            print("This section may exceed ten minutes at the measured speed; the cutoff remains active.", flush=True)
+        if path is None or not path.is_file():
+            path = download_section(job, plan["format"], info, index, start, end)
+            section.update(file=str(path.relative_to(job.resolve())), status="downloaded")
+            save_plan(job, plan)
+        else:
+            verify_section(path, end - start)
+        budget = remaining()
+        spent = MAX_SECONDS - budget
+        print(f"Section timer: {int(spent // 60)}m {int(spent % 60):02d}s used; "
+              f"{int(budget // 60)}m {int(budget % 60):02d}s left for upload and verification.", flush=True)
+        upload_file(path, destination, folder, info["id"])
+        section["status"] = "uploaded"
+        save_plan(job, plan)
+        elapsed = MAX_SECONDS - remaining()
+        print(f"Section {index} completed in {int(elapsed // 60)}m {int(elapsed % 60):02d}s.", flush=True)
+
+
+def download_and_upload(url, mode, repo):
+    DOWNLOADS.mkdir(parents=True, exist_ok=True)
+    print("Checking for 1080p or the closest source to produce 720p sections...", flush=True)
+    info = json.loads(run(["yt-dlp", "--no-playlist", "--skip-download", "--dump-single-json", "--", url], capture=True).stdout)
+    duration = float(info.get("duration") or 0)
+    # Selecting the same recorded video continues its saved job rather than
+    # downloading again or colliding with its immutable files in Drive.
+    candidates = [p for p in DOWNLOADS.glob("selection-*/section-plan.json")
+                  if not p.is_symlink() and not p.parent.is_symlink()]
+    for candidate in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            existing = json.loads(candidate.read_text())
+            expected = section_ranges(duration, existing.get("section_seconds", 1200))
+            matches = (existing.get("schema") == "ytfzf-sections-v1" and existing.get("video_id") == info.get("id")
+                    and float(existing["duration"]) == duration
+                    and [(s["start"], s["end"]) for s in existing["sections"]]
+                    == [(s["start"], s["end"]) for s in expected])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if matches:
+            print("Continuing the saved section transfer for this video.", flush=True)
+            process_sections(candidate.parent, existing, mode, repo, info=info)
+            print("All video sections uploaded and verified.")
+            return
+    job = Path(tempfile.mkdtemp(prefix="selection-", dir=DOWNLOADS))
+    (job / "source.txt").write_text(url + "\n")
+    spec, bytes_per_second = choose_section_format(info)
+    plan = {"schema": "ytfzf-sections-v1", "url": url, "video_id": info.get("id"),
+            "format": spec, "duration": duration, "bytes_per_second": bytes_per_second,
+            "section_seconds": SECTION_SECONDS, "sections": section_ranges(duration)}
+    save_plan(job, plan)
+    process_sections(job, plan, mode, repo, info=info)
+    print("All video sections uploaded and verified.")
+
+
+def resume_sections(job, mode, repo):
+    job = job.resolve(strict=True)
+    if not job.is_relative_to(DOWNLOADS.resolve()):
+        raise RuntimeError("Resume jobs must be in ~/Videos/ytfzf-drive.")
+    plan = json.loads((job / "section-plan.json").read_text())
+    if plan.get("schema") != "ytfzf-sections-v1":
+        raise RuntimeError("This job is not a section transfer.")
+    expected = section_ranges(float(plan["duration"]), plan.get("section_seconds", 1200))
+    if [(s["start"], s["end"]) for s in plan["sections"]] != [(s["start"], s["end"]) for s in expected]:
+        raise RuntimeError("Section plan ranges do not cover the source.")
+    process_sections(job, plan, mode, repo)
+    print("All video sections uploaded and verified.")
+
+
+def main():
+    global DEADLINE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--setup", action="store_true", help="Connect Google Drive with a browser sign-in")
+    parser.add_argument("--client-json", type=Path, help="Import the dedicated desktop OAuth JSON locally (use with --setup)")
+    parser.add_argument("--headless", action="store_true", help="Print a browser sign-in link instead of opening a browser (use with --setup)")
+    parser.add_argument("--retry", type=Path, help="Upload a retained local video without downloading it again")
+    parser.add_argument("--resume", type=Path, help="Continue an interrupted video section transfer")
+    parser.add_argument("--destination", choices=("auto", "drive", "github"),
+                        help="Choose Drive, GitHub, or Drive with GitHub fallback (auto)")
+    parser.add_argument("--github-repo", help="GitHub Release destination, as owner/repository")
+    parser.add_argument("urls", nargs="*")
+    args = parser.parse_args()
+    if args.headless and not args.setup:
+        parser.error("--headless requires --setup")
+    if args.client_json and not args.setup:
+        parser.error("--client-json requires --setup")
+    if args.setup:
+        if not shutil.which("rclone"):
+            raise RuntimeError("rclone is missing")
+        if args.client_json:
+            setup_dedicated_client(args.client_json, args.headless)
+        else:
+            setup(args.headless)
+        return
+    if not args.retry and not args.resume and not args.urls:
+        parser.error("Provide a selected URL, --resume JOB, --retry FILE, or --setup")
+    DEADLINE = time.monotonic() + MAX_SECONDS
+    settings = json.loads(DESTINATIONS.read_text()) if DESTINATIONS.exists() else {}
+    repo = args.github_repo or os.environ.get("YTFZF_GITHUB_REPO") or settings.get("github_repo")
+    mode = args.destination or settings.get("destination", "auto")
+    if mode not in ("auto", "drive", "github"):
+        raise RuntimeError("Invalid default destination in destinations.json.")
+    if args.retry:
+        path = args.retry.resolve(strict=True)
+        match = re.match(r"(.*?) \[([A-Za-z0-9_-]{11})\]", path.name)
+        folder = video_folder(match[1], match[2]) if match else video_folder(path.stem, "local")
+        receipt = read_receipt(path)
+        pinned = receipt_destination(receipt) if receipt else None
+        destination = select_destination(mode, repo, pinned, folder)
+        upload_file(path, destination, folder, match[2] if match else None)
+    elif args.resume:
+        resume_sections(args.resume, mode, repo)
+    else:
+        for url in args.urls:
+            DEADLINE = time.monotonic() + MAX_SECONDS
+            download_and_upload(url, mode, repo)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except CommandError as error:
+        if error.quota_limited:
+            print("Upload paused: Google Drive rate-limited rclone's shared API client. "
+                  "Completed sections are retained. Select the same video again to resume, "
+                  "or use the printed --resume command. A dedicated Drive API client avoids the shared quota.", file=sys.stderr)
+        else:
+            print(f"Upload stopped: {error}\nCompleted files remain in {DOWNLOADS}.", file=sys.stderr)
+        sys.exit(1)
+    except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError, TimeoutError) as error:
+        print(f"Upload stopped: {error}\nAny completed downloads remain in {DOWNLOADS}.", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nCancelled. Local downloads are retained.", file=sys.stderr)
+        sys.exit(130)

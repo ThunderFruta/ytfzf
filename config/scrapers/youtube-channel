@@ -1,0 +1,13 @@
+scrape_youtube_channel() {
+    [ "$1" = ':help' ] && { printf '%s\n' 'Browse videos from a YouTube channel URL.'; return 100; }
+    _yt_channel_url="${1%/}"
+    case "$_yt_channel_url" in
+        https://www.youtube.com/*|https://youtube.com/*) ;;
+        *) printf '%s\n' 'Expected a YouTube channel URL.' >&2; return 2 ;;
+    esac
+    _yt_channel_url="${_yt_channel_url%/videos}/videos"
+    _yt_html="${session_temp_dir}/yt-channel.html"
+    printf 'Fetching channel videos (%s)...\n' "$_yt_channel_url"
+    _get_request "$_yt_channel_url" >"$_yt_html" || return
+    python3 "$HOME/.local/share/ytfzf-install/youtube_results.py" "$_yt_html" channel-videos >>"$2"
+}

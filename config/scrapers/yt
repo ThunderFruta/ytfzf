@@ -1,0 +1,12 @@
+# Local YouTube parser: includes channel submenus and modern video cards.
+scrape_yt() {
+    [ "$1" = ':help' ] && { printf '%s\n' 'Search YouTube; use --type=channel for channels only.'; return 100; }
+    _yt_html="${session_temp_dir}/yt-search.html"
+    printf 'Searching YouTube (%s)...\n' "$1"
+    if [ "$search_result_type" = channel ]; then
+        _get_request 'https://www.youtube.com/results' -G --data-urlencode "search_query=$1" --data-urlencode 'sp=EgIQAg==' >"$_yt_html" || return
+    else
+        _get_request 'https://www.youtube.com/results' -G --data-urlencode "search_query=$1" >"$_yt_html" || return
+    fi
+    python3 "$HOME/.local/share/ytfzf-install/youtube_results.py" "$_yt_html" "$search_result_type" >>"$2"
+}

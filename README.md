@@ -38,4 +38,6 @@ ytfzf-drive --resume ~/Videos/ytfzf-drive/selection-EXAMPLE
 ytfzf-drive --retry /path/to/retained-section.mkv
 ```
 
+Use `YTFZF_DESTINATION=github ytfzf SEARCH` to override the default for one ytfzf invocation.
+
 Jobs retain their destination when resumed. A new destination setting applies to new jobs. Use a repository you control and publish only videos you have permission to distribute.

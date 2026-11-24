@@ -453,7 +453,7 @@ def upload_file(path, destination, folder, video_id=None):
         return
     started = time.monotonic()
     if destination["type"] == "github":
-        print(f"Uploading {path.name} to public GitHub Releases at {destination['repo']}...", flush=True)
+        print(f"Uploading {path.name} to GitHub Releases at {destination['repo']}...", flush=True)
         receipt = upload_github(path, folder, destination["repo"], video_id)
     else:
         print(f"Uploading {path.name} to Google Drive/{folder}...", flush=True)
@@ -774,9 +774,9 @@ def main():
     DEADLINE = time.monotonic() + MAX_SECONDS
     settings = json.loads(DESTINATIONS.read_text()) if DESTINATIONS.exists() else {}
     repo = args.github_repo or os.environ.get("YTFZF_GITHUB_REPO") or settings.get("github_repo")
-    mode = args.destination or settings.get("destination", "auto")
+    mode = args.destination or os.environ.get("YTFZF_DESTINATION") or settings.get("destination", "auto")
     if mode not in ("auto", "drive", "github"):
-        raise RuntimeError("Invalid default destination in destinations.json.")
+        raise RuntimeError("Invalid upload destination. Use auto, drive, or github.")
     if args.retry:
         path = args.retry.resolve(strict=True)
         match = re.match(r"(.*?) \[([A-Za-z0-9_-]{11})\]", path.name)
